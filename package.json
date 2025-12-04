@@ -17,7 +17,13 @@
   "license": "MIT",
   "dependencies": {
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
+    "better-sqlite3": "^12.5.0",
+    "csv-parse": "^6.1.0",
+    "dotenv": "^17.2.3",
+    "fuse.js": "^7.1.0",
+    "libphonenumber-js": "^1.12.31",
     "link-preview-js": "^3.2.0",
+    "pg": "^8.16.3",
     "pino": "^10.1.0",
     "qrcode-terminal": "^0.12.0"
   }
