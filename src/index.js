@@ -1,20 +1,55 @@
+import 'dotenv/config';
 import makeWASocket, { 
   DisconnectReason, 
   useMultiFileAuthState,
-  makeCacheableSignalKeyStore
+  makeCacheableSignalKeyStore,
+  Browsers,
+  downloadMediaMessage
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { Boom } from '@hapi/boom';
 import { handleCommand } from './commands.js';
 import { BOT_NAME, MESSAGES } from './config.js';
+import { upsertContactsFromVcard, upsertContactsFromCsv, isDatabaseAvailable } from './data/contacts.js';
 
 const logger = pino({ level: 'silent' });
 
 const AUTH_FOLDER = './auth_info_baileys';
 
 let connectionSuccessMessageSent = false;
+let pairingCodeRequested = false;
+let currentSock = null;
+let isRestarting = false;
+
+const ownerNumber = process.env.PHONE_NUMBER?.replace(/[^0-9]/g, '');
+
+async function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function cleanupSocket() {
+  if (currentSock) {
+    try {
+      currentSock.ev.removeAllListeners();
+      currentSock.end();
+    } catch (err) {
+      // Ignore cleanup errors
+    }
+    currentSock = null;
+  }
+}
 
 async function startBot() {
+  if (isRestarting) {
+    console.log('Already restarting, skipping...');
+    return;
+  }
+  
+  isRestarting = true;
+  cleanupSocket();
+  
+  await delay(1000);
+  
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   
   const phoneNumber = process.env.PHONE_NUMBER;
@@ -33,10 +68,12 @@ async function startBot() {
     process.exit(1);
   }
 
+  const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+
   console.log('╔════════════════════════════════════════╗');
   console.log('║         MSAI Whats Bot Starting        ║');
   console.log('╠════════════════════════════════════════╣');
-  console.log(`║  Phone: ${phoneNumber.padEnd(28)}║`);
+  console.log(`║  Phone: ${cleanNumber.padEnd(28)}║`);
   console.log('╚════════════════════════════════════════╝');
 
   const sock = makeWASocket({
@@ -46,20 +83,26 @@ async function startBot() {
     },
     printQRInTerminal: false,
     logger,
-    browser: ['MSAI Whats', 'Chrome', '120.0.0'],
+    browser: Browsers.ubuntu('Chrome'),
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 0,
-    keepAliveIntervalMs: 30000,
+    keepAliveIntervalMs: 25000,
     emitOwnEvents: true,
-    markOnlineOnConnect: true
+    markOnlineOnConnect: true,
+    syncFullHistory: false,
+    retryRequestDelayMs: 250
   });
+  
+  currentSock = sock;
+  isRestarting = false;
 
   if (!state.creds.registered) {
-    const cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+    console.log('\n📱 Waiting for connection to request pairing code...\n');
     
-    console.log('\n📱 Requesting pairing code...\n');
+    await delay(5000);
     
-    setTimeout(async () => {
+    if (!pairingCodeRequested) {
+      pairingCodeRequested = true;
       try {
         const code = await sock.requestPairingCode(cleanNumber);
         console.log('╔════════════════════════════════════════╗');
@@ -78,43 +121,50 @@ async function startBot() {
         console.log('╚════════════════════════════════════════╝');
       } catch (err) {
         console.error('Failed to request pairing code:', err.message);
+        pairingCodeRequested = false;
       }
-    }, 3000);
+    }
   }
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+    const { connection, lastDisconnect } = update;
 
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       
       console.log(`\n⚠️ Connection closed. Reason: ${DisconnectReason[reason] || reason}`);
       
+      pairingCodeRequested = false;
+      isRestarting = false;
+      
+      const shouldReconnect = reason !== DisconnectReason.loggedOut && 
+                              reason !== DisconnectReason.badSession &&
+                              reason !== DisconnectReason.connectionReplaced;
+      
       switch (reason) {
         case DisconnectReason.badSession:
           console.log('Bad session, please delete auth folder and restart');
           break;
-        case DisconnectReason.connectionClosed:
-        case DisconnectReason.connectionLost:
-        case DisconnectReason.timedOut:
-          console.log('Reconnecting...');
-          setTimeout(() => startBot(), 5000);
-          break;
         case DisconnectReason.connectionReplaced:
-          console.log('Connection replaced, another session opened');
+          console.log('Connection replaced, another session opened. Not reconnecting.');
           break;
         case DisconnectReason.loggedOut:
           console.log('Logged out, please delete auth folder and restart');
           break;
         case DisconnectReason.restartRequired:
-          console.log('Restart required, restarting...');
-          startBot();
+          console.log('Restart required, restarting immediately...');
+          setTimeout(() => startBot(), 1000);
           break;
+        case DisconnectReason.connectionClosed:
+        case DisconnectReason.connectionLost:
+        case DisconnectReason.timedOut:
         default:
-          console.log('Unknown disconnect reason, reconnecting...');
-          setTimeout(() => startBot(), 5000);
+          if (shouldReconnect) {
+            console.log('Reconnecting in 3 seconds...');
+            setTimeout(() => startBot(), 3000);
+          }
       }
     }
 
@@ -145,36 +195,257 @@ async function startBot() {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
+      try {
+        if (!msg.message) continue;
 
-      const startTime = Date.now();
-      
-      const messageContent = msg.message.conversation || 
-                            msg.message.extendedTextMessage?.text || 
-                            '';
-      
-      const remoteJid = msg.key.remoteJid;
-      const isGroup = remoteJid.endsWith('@g.us');
-      const sender = isGroup ? msg.key.participant : remoteJid;
-      
-      console.log(`📩 Message from ${sender}: ${messageContent}`);
+        const remoteJid = msg.key.remoteJid;
+        
+        if (!remoteJid) continue;
+        if (remoteJid.endsWith('@newsletter')) continue;
+        if (remoteJid === 'status@broadcast') continue;
+        if (msg.key.fromMe) continue;
 
-      const response = handleCommand(messageContent, startTime);
+        const startTime = Date.now();
+        
+        const messageContent = msg.message.conversation || 
+                              msg.message.extendedTextMessage?.text ||
+                              msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+                              msg.message.documentMessage?.caption ||
+                              '';
+        
+        const documentMessage = msg.message.documentWithCaptionMessage?.message?.documentMessage || 
+                                msg.message.documentMessage;
+        const hasDocument = !!documentMessage;
+        const documentMimeType = documentMessage?.mimetype || '';
+        const documentFileName = documentMessage?.fileName || '';
+        
+        const isGroup = remoteJid.endsWith('@g.us');
+        const sender = isGroup ? msg.key.participant : remoteJid;
+        const senderNumber = sender?.split('@')[0] || '';
+        const isOwner = senderNumber === ownerNumber;
+        
+        console.log(`📩 Message from ${sender}: ${messageContent.substring(0, 50)}`);
+
+      const context = {
+        isGroup,
+        sender,
+        senderNumber,
+        isOwner,
+        remoteJid,
+        sock,
+        hasDocument,
+        documentMimeType,
+        documentFileName,
+        msg
+      };
+
+      const result = handleCommand(messageContent, startTime, context);
       
-      if (response) {
+      if (result) {
         try {
-          await sock.sendMessage(remoteJid, { text: response }, { quoted: msg });
-          console.log(`📤 Response sent in ${Date.now() - startTime}ms`);
+          if (result.react) {
+            await sock.sendMessage(remoteJid, {
+              react: {
+                text: result.react,
+                key: msg.key
+              }
+            });
+          }
+
+          if (result.action) {
+            await handleAction(sock, result.action, msg, context);
+          } else if (result.response) {
+            await sock.sendMessage(remoteJid, { text: result.response }, { quoted: msg });
+            console.log(`📤 Response sent in ${Date.now() - startTime}ms`);
+          }
         } catch (err) {
           console.error('Error sending message:', err.message);
         }
+      }
+      } catch (err) {
+        console.error('Error processing message:', err.message);
       }
     }
   });
 
   return sock;
 }
+
+async function handleAction(sock, action, msg, context) {
+  const { remoteJid, isGroup } = context;
+
+  switch (action.type) {
+    case 'tagall': {
+      if (!isGroup) return;
+      try {
+        const groupMetadata = await sock.groupMetadata(remoteJid);
+        const participants = groupMetadata.participants;
+        
+        let mentionText = `📢 *${action.message}*\n\n`;
+        const mentions = [];
+        
+        for (const participant of participants) {
+          mentions.push(participant.id);
+          mentionText += `@${participant.id.split('@')[0]}\n`;
+        }
+        
+        await sock.sendMessage(remoteJid, { 
+          text: mentionText, 
+          mentions 
+        }, { quoted: msg });
+        console.log(`📤 Tagged ${participants.length} members`);
+      } catch (err) {
+        console.error('Error in tagall:', err.message);
+        await sock.sendMessage(remoteJid, { text: '❌ Failed to tag members. Make sure bot is admin.' }, { quoted: msg });
+      }
+      break;
+    }
+
+    case 'groupinfo': {
+      if (!isGroup) return;
+      try {
+        const groupMetadata = await sock.groupMetadata(remoteJid);
+        const created = new Date(groupMetadata.creation * 1000).toLocaleDateString();
+        const admins = groupMetadata.participants.filter(p => p.admin).length;
+        
+        const infoText = `👥 *Group Information*\n\n` +
+          `▸ *Name:* ${groupMetadata.subject}\n` +
+          `▸ *Members:* ${groupMetadata.participants.length}\n` +
+          `▸ *Admins:* ${admins}\n` +
+          `▸ *Created:* ${created}\n` +
+          `▸ *Description:*\n${groupMetadata.desc || 'No description'}`;
+        
+        await sock.sendMessage(remoteJid, { text: infoText }, { quoted: msg });
+        console.log('📤 Group info sent');
+      } catch (err) {
+        console.error('Error in groupinfo:', err.message);
+        await sock.sendMessage(remoteJid, { text: '❌ Failed to get group info.' }, { quoted: msg });
+      }
+      break;
+    }
+
+    case 'admins': {
+      if (!isGroup) return;
+      try {
+        const groupMetadata = await sock.groupMetadata(remoteJid);
+        const admins = groupMetadata.participants.filter(p => p.admin);
+        
+        let adminText = `👑 *Group Admins*\n\n`;
+        const mentions = [];
+        
+        for (const admin of admins) {
+          mentions.push(admin.id);
+          const role = admin.admin === 'superadmin' ? '👑 Owner' : '⭐ Admin';
+          adminText += `${role}: @${admin.id.split('@')[0]}\n`;
+        }
+        
+        await sock.sendMessage(remoteJid, { 
+          text: adminText, 
+          mentions 
+        }, { quoted: msg });
+        console.log(`📤 Listed ${admins.length} admins`);
+      } catch (err) {
+        console.error('Error in admins:', err.message);
+        await sock.sendMessage(remoteJid, { text: '❌ Failed to get admin list.' }, { quoted: msg });
+      }
+      break;
+    }
+
+    case 'broadcast': {
+      await sock.sendMessage(remoteJid, { 
+        text: `📢 *Broadcast*\n\n${action.message}\n\n_From: ${BOT_NAME}_` 
+      }, { quoted: msg });
+      console.log('📤 Broadcast sent');
+      break;
+    }
+
+    case 'send_vcard': {
+      try {
+        const contact = action.contact;
+        
+        if (action.message) {
+          await sock.sendMessage(remoteJid, { text: action.message }, { quoted: msg });
+        }
+        
+        await sock.sendMessage(remoteJid, {
+          contacts: {
+            displayName: contact.displayName,
+            contacts: [{
+              vcard: contact.rawVcard
+            }]
+          }
+        }, { quoted: msg });
+        
+        console.log(`📤 Contact "${contact.displayName}" sent`);
+      } catch (err) {
+        console.error('Error sending vCard:', err.message);
+        await sock.sendMessage(remoteJid, { text: '❌ Failed to send contact.' }, { quoted: msg });
+      }
+      break;
+    }
+
+    case 'add_contact_file': {
+      try {
+        if (!isDatabaseAvailable()) {
+          await sock.sendMessage(remoteJid, { 
+            text: `❌ Contact database is not available.\n\nPlease try again later or contact the administrator.` 
+          }, { quoted: msg });
+          break;
+        }
+        
+        const { documentMimeType, documentFileName, msg: originalMsg } = context;
+        
+        const isVcard = documentMimeType === 'text/vcard' || 
+                        documentMimeType === 'text/x-vcard' ||
+                        documentFileName?.toLowerCase().endsWith('.vcf');
+        const isCsv = documentMimeType === 'text/csv' || 
+                      documentMimeType === 'application/csv' ||
+                      documentFileName?.toLowerCase().endsWith('.csv');
+        
+        if (!isVcard && !isCsv) {
+          await sock.sendMessage(remoteJid, { 
+            text: `❌ Unsupported file format.\n\nPlease send a *.vcf* (vCard) or *.csv* file.` 
+          }, { quoted: msg });
+          break;
+        }
+        
+        await sock.sendMessage(remoteJid, { text: '📥 Processing contacts...' }, { quoted: msg });
+        
+        const buffer = await downloadMediaMessage(originalMsg, 'buffer', {});
+        
+        let result;
+        if (isVcard) {
+          result = upsertContactsFromVcard(buffer);
+        } else {
+          result = upsertContactsFromCsv(buffer);
+        }
+        
+        const successMessage = `✅ *Contacts Added Successfully!*\n\n` +
+          `▸ *New contacts:* ${result.added}\n` +
+          `▸ *Updated:* ${result.updated}\n` +
+          `▸ *Total processed:* ${result.total}\n\n` +
+          `_Use .contact [name] to find a contact_`;
+        
+        await sock.sendMessage(remoteJid, { text: successMessage }, { quoted: msg });
+        console.log(`📤 Added ${result.added} contacts, updated ${result.updated}`);
+      } catch (err) {
+        console.error('Error processing contact file:', err.message);
+        await sock.sendMessage(remoteJid, { 
+          text: `❌ Failed to process contacts file.\n\nError: ${err.message}` 
+        }, { quoted: msg });
+      }
+      break;
+    }
+  }
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+});
 
 console.log(`
 ╔═══════════════════════════════════════════╗

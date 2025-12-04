@@ -1,5 +1,5 @@
 export const BOT_NAME = 'MSAI Whats';
-export const BOT_PREFIX = '!';
+export const BOT_PREFIX = '.';
 export const BOT_VERSION = '1.0.0';
 
 export const MESSAGES = {
